@@ -37,7 +37,7 @@ use miner::{Miner, MinerService};
 use spec::Spec;
 
 use block_queue::BlockQueueInfo;
-use block::{OpenBlock, SealedBlock};
+use block::{OpenBlock, SealedBlock, Block};
 use executive::Executed;
 use error::CallError;
 use trace::LocalizedTrace;
@@ -291,6 +291,10 @@ impl MiningBlockChainClient for TestBlockChainClient {
 	}
 
 	fn import_sealed_block(&self, _block: SealedBlock) -> ImportResult {
+		Ok(H256::default())
+	}
+
+	fn import_verified_block(&self, _block: Block) -> ImportResult {
 		Ok(H256::default())
 	}
 }

@@ -23,6 +23,7 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Instant, Duration};
 use std::sync::{Arc, Weak};
+use rustc_serialize::hex::ToHex;
 use ethsync::{SyncProvider, SyncState};
 use ethcore::miner::{MinerService, ExternalMinerService};
 use jsonrpc_core::*;
@@ -33,9 +34,9 @@ use util::{FromHex, Mutex};
 use ethcore::account_provider::AccountProvider;
 use ethcore::client::{MiningBlockChainClient, BlockID, TransactionID, UncleID};
 use ethcore::header::Header as BlockHeader;
-use ethcore::block::IsBlock;
+use ethcore::block::{Block as EthBlock};
 use ethcore::views::*;
-use ethcore::ethereum::Ethash;
+use ethcore::Seal;
 use ethcore::transaction::{Transaction as EthTransaction, SignedTransaction, Action};
 use ethcore::log_entry::LogEntry;
 use ethcore::filter::Filter as EthcoreFilter;
@@ -75,7 +76,7 @@ pub struct EthClient<C, S: ?Sized, M, EM> where
 	accounts: Weak<AccountProvider>,
 	miner: Weak<M>,
 	external_miner: Arc<EM>,
-	seed_compute: Mutex<SeedHashCompute>,
+	_seed_compute: Mutex<SeedHashCompute>,
 	options: EthClientOptions,
 }
 
@@ -94,7 +95,7 @@ impl<C, S: ?Sized, M, EM> EthClient<C, S, M, EM> where
 			miner: Arc::downgrade(miner),
 			accounts: Arc::downgrade(accounts),
 			external_miner: em.clone(),
-			seed_compute: Mutex::new(SeedHashCompute::new()),
+			_seed_compute: Mutex::new(SeedHashCompute::new()),
 			options: options,
 		}
 	}
@@ -190,6 +191,34 @@ impl<C, S: ?Sized, M, EM> EthClient<C, S, M, EM> where
 			value: request.value.unwrap_or_else(U256::zero),
 			data: request.data.map_or_else(Vec::new, |d| d.to_vec())
 		}.fake_sign(from))
+	}
+
+	fn return_block_data<F>(&self, f: F) -> Result<Value, Error>
+		where F: FnOnce(&EthBlock) -> Result<Value, Error> {
+
+		let client = take_weak!(self.client);
+		// check if we're still syncing and return empty strings in that case
+		{
+			//TODO: check if initial sync is complete here
+			//let sync = take_weak!(self.sync);
+			if /*sync.status().state != SyncState::Idle ||*/ client.queue_info().total_queue_size() > MAX_QUEUE_SIZE_TO_MINE_ON {
+				trace!(target: "miner", "Syncing. Cannot give any work.");
+				return Err(errors::no_work());
+			}
+
+			// Otherwise spin until our submitted block has been included.
+			let timeout = Instant::now() + Duration::from_millis(1000);
+			while Instant::now() < timeout && client.queue_info().total_queue_size() > 0 {
+				thread::sleep(Duration::from_millis(1));
+			}
+		}
+
+		let miner = take_weak!(self.miner);
+		if miner.author().is_zero() {
+			warn!(target: "miner", "Cannot give work package - no author is configured. Use --author to configure!");
+			return Err(errors::no_author())
+		}
+		miner.map_sealing_work(&*client, |b| { f(b) }).unwrap_or(Err(Error::internal_error()))	// no work found.
 	}
 }
 
@@ -520,41 +549,13 @@ impl<C, S: ?Sized, M, EM> Eth for EthClient<C, S, M, EM> where
 	fn work(&self, params: Params) -> Result<Value, Error> {
 		try!(self.active());
 		try!(expect_no_params(params));
+		self.return_block_data(|b| to_value(&b.header.rlp(Seal::Without).to_hex()))
+	}
 
-		let client = take_weak!(self.client);
-		// check if we're still syncing and return empty strings in that case
-		{
-			//TODO: check if initial sync is complete here
-			//let sync = take_weak!(self.sync);
-			if /*sync.status().state != SyncState::Idle ||*/ client.queue_info().total_queue_size() > MAX_QUEUE_SIZE_TO_MINE_ON {
-				trace!(target: "miner", "Syncing. Cannot give any work.");
-				return Err(errors::no_work());
-			}
-
-			// Otherwise spin until our submitted block has been included.
-			let timeout = Instant::now() + Duration::from_millis(1000);
-			while Instant::now() < timeout && client.queue_info().total_queue_size() > 0 {
-				thread::sleep(Duration::from_millis(1));
-			}
-		}
-
-		let miner = take_weak!(self.miner);
-		if miner.author().is_zero() {
-			warn!(target: "miner", "Cannot give work package - no author is configured. Use --author to configure!");
-			return Err(errors::no_author())
-		}
-		miner.map_sealing_work(&*client, |b| {
-			let pow_hash = b.hash();
-			let target = Ethash::difficulty_to_boundary(b.block().header().difficulty());
-			let seed_hash = self.seed_compute.lock().get_seedhash(b.block().header().number());
-
-			if self.options.send_block_number_in_get_work {
-				let block_number = RpcU256::from(b.block().header().number());
-				to_value(&(RpcH256::from(pow_hash), RpcH256::from(seed_hash), RpcH256::from(target), block_number))
-			} else {
-				to_value(&(RpcH256::from(pow_hash), RpcH256::from(seed_hash), RpcH256::from(target)))
-			}
-		}).unwrap_or(Err(Error::internal_error()))	// no work found.
+	fn block_template(&self, params: Params) -> Result<Value, Error> {
+		try!(self.active());
+		try!(expect_no_params(params));
+		self.return_block_data(|b| to_value(&b.rlp_bytes(Seal::Without).to_hex()))
 	}
 
 	fn submit_work(&self, params: Params) -> Result<Value, Error> {
@@ -568,6 +569,17 @@ impl<C, S: ?Sized, M, EM> Eth for EthClient<C, S, M, EM> where
 			let client = take_weak!(self.client);
 			let seal = vec![encode(&mix_hash).to_vec(), encode(&nonce).to_vec()];
 			let r = miner.submit_seal(&*client, pow_hash, seal);
+			to_value(&r.is_ok())
+		})
+	}
+
+	fn submit_block_template(&self, params: Params) -> Result<Value, Error> {
+		try!(self.active());
+		from_params::<(String, )>(params).and_then(|(s, )| {
+			let bytes = try!(s.from_hex().map_err(|_| errors::internal("Invalid hex data", s)));
+			trace!(target: "miner", "submit_block_template: Decoded: bytes={:?}", bytes);
+			let miner = take_weak!(self.miner);
+			let r = miner.submit_work_block(bytes.into());
 			to_value(&r.is_ok())
 		})
 	}

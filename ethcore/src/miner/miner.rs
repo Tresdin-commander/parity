@@ -31,7 +31,7 @@ use receipt::{Receipt, RichReceipt};
 use spec::Spec;
 use engines::Engine;
 use miner::{MinerService, MinerStatus, TransactionQueue, AccountDetails, TransactionOrigin};
-use miner::work_notify::WorkPoster;
+use miner::work_notify::{WorkPoster, UdpPoster};
 use client::TransactionImportResult;
 use miner::price_info::PriceInfo;
 
@@ -159,8 +159,36 @@ impl GasPricer {
 	}
 }
 
+#[derive(Clone)]
+enum BlockEntry {
+	Closed(ClosedBlock),
+	Raw(Block),
+}
+
+impl BlockEntry {
+	fn as_closed(&self) -> Option<&ClosedBlock> {
+		match *self {
+			BlockEntry::Closed(ref b) => Some(b),
+			_ => None,
+		}
+	}
+
+	fn as_block(&self) -> &Block {
+		match *self {
+			BlockEntry::Closed(ref b) => b.base(),
+			BlockEntry::Raw(ref b) => b,
+		}
+	}
+	fn hash(&self) -> H256 {
+		match *self {
+			BlockEntry::Closed(ref b) => b.hash(),
+			BlockEntry::Raw(ref b) => b.header.hash(),
+		}
+	}
+}
+
 struct SealingWork {
-	queue: UsingQueue<ClosedBlock>,
+	queue: UsingQueue<BlockEntry>,
 	enabled: bool,
 }
 
@@ -181,6 +209,7 @@ pub struct Miner {
 
 	accounts: Option<Arc<AccountProvider>>,
 	work_poster: Option<WorkPoster>,
+	udp_poster: UdpPoster,
 	gas_pricer: Mutex<GasPricer>,
 }
 
@@ -200,6 +229,7 @@ impl Miner {
 			engine: spec.engine.clone(),
 			work_poster: None,
 			gas_pricer: Mutex::new(GasPricer::new_fixed(20_000_000_000u64.into())),
+			udp_poster: UdpPoster::new(),
 		}
 	}
 
@@ -220,6 +250,7 @@ impl Miner {
 			engine: spec.engine.clone(),
 			work_poster: work_poster,
 			gas_pricer: Mutex::new(gas_pricer),
+			udp_poster: UdpPoster::new(),
 		})
 	}
 
@@ -229,12 +260,12 @@ impl Miner {
 
 	/// Get `Some` `clone()` of the current pending block's state or `None` if we're not sealing.
 	pub fn pending_state(&self) -> Option<State> {
-		self.sealing_work.lock().queue.peek_last_ref().map(|b| b.block().fields().state.clone())
+		self.sealing_work.lock().queue.peek_last_ref().and_then(|b| b.as_closed()).map(|b| b.block().fields().state.clone())
 	}
 
 	/// Get `Some` `clone()` of the current pending block's state or `None` if we're not sealing.
 	pub fn pending_block(&self) -> Option<Block> {
-		self.sealing_work.lock().queue.peek_last_ref().map(|b| b.base().clone())
+		self.sealing_work.lock().queue.peek_last_ref().and_then(|b| b.as_closed()).map(|b| b.base().clone())
 	}
 
 	/// Prepares new block for sealing including top transactions from queue.
@@ -256,7 +287,7 @@ impl Miner {
 		let (transactions, mut open_block, original_work_hash) = {
 			let transactions = {self.transaction_queue.lock().top_transactions()};
 			let mut sealing_work = self.sealing_work.lock();
-			let last_work_hash = sealing_work.queue.peek_last_ref().map(|pb| pb.block().fields().header.hash());
+			let last_work_hash = sealing_work.queue.peek_last_ref().and_then(|b| b.as_closed()).map(|pb| pb.block().fields().header.hash());
 			let best_hash = chain.best_block_header().sha3();
 /*
 			// check to see if last ClosedBlock in would_seals is actually same parent block.
@@ -266,13 +297,16 @@ impl Miner {
 			//   otherwise, leave everything alone.
 			// otherwise, author a fresh block.
 */
-			let open_block = match sealing_work.queue.pop_if(|b| b.block().fields().header.parent_hash() == &best_hash) {
-				Some(old_block) => {
+			let open_block = match sealing_work.queue.pop_if(|b| match b {
+				&BlockEntry::Closed(ref b) =>  b.block().fields().header.parent_hash() == &best_hash,
+				_ => false,
+				}) {
+				Some(BlockEntry::Closed(old_block)) => {
 					trace!(target: "miner", "Already have previous work; updating and returning");
 					// add transactions to old_block
 					old_block.reopen(&*self.engine, chain.vm_factory())
-				}
-				None => {
+				},
+				_ => {
 					// block not found - create it.
 					trace!(target: "miner", "No existing work - making new block");
 					chain.prepare_open_block(
@@ -366,28 +400,28 @@ impl Miner {
 
 		let (work, is_new) = {
 			let mut sealing_work = self.sealing_work.lock();
-			let last_work_hash = sealing_work.queue.peek_last_ref().map(|pb| pb.block().fields().header.hash());
+			let last_work_hash = sealing_work.queue.peek_last_ref().and_then(|b| b.as_closed()).map(|pb| pb.block().fields().header.hash());
 			trace!(target: "miner", "Checking whether we need to reseal: orig={:?} last={:?}, this={:?}", original_work_hash, last_work_hash, block.block().fields().header.hash());
 			let (work, is_new) = if last_work_hash.map_or(true, |h| h != block.block().fields().header.hash()) {
 				trace!(target: "miner", "Pushing a new, refreshed or borrowed pending {}...", block.block().fields().header.hash());
-				let pow_hash = block.block().fields().header.hash();
+				let header = block.block().fields().header.clone();
 				let number = block.block().fields().header.number();
 				let difficulty = *block.block().fields().header.difficulty();
 				let is_new = original_work_hash.map_or(true, |h| block.block().fields().header.hash() != h);
-				sealing_work.queue.push(block);
+				sealing_work.queue.push(BlockEntry::Closed(block));
 				// If push notifications are enabled we assume all work items are used.
-				if self.work_poster.is_some() && is_new {
+				if is_new {
 					sealing_work.queue.use_last_ref();
 				}
-				(Some((pow_hash, difficulty, number)), is_new)
+				(Some((header, difficulty, number)), is_new)
 			} else {
 				(None, false)
 			};
-			trace!(target: "miner", "prepare_sealing: leaving (last={:?})", sealing_work.queue.peek_last_ref().map(|b| b.block().fields().header.hash()));
 			(work, is_new)
 		};
 		if is_new {
-			work.map(|(pow_hash, difficulty, number)| self.work_poster.as_ref().map(|ref p| p.notify(pow_hash, difficulty, number)));
+			work.as_ref().map(|&(ref header, _, _)| self.udp_poster.notify(&header));
+			work.map(|(header, difficulty, number)| self.work_poster.as_ref().map(|ref p| p.notify(header.hash(), difficulty, number)));
 		}
 	}
 
@@ -465,13 +499,21 @@ impl MinerService for Miner {
 		MinerStatus {
 			transactions_in_pending_queue: status.pending,
 			transactions_in_future_queue: status.future,
-			transactions_in_pending_block: sealing_work.queue.peek_last_ref().map_or(0, |b| b.transactions().len()),
+			transactions_in_pending_block: sealing_work.queue.peek_last_ref().and_then(|b| b.as_closed()).map_or(0, |b| b.transactions().len()),
 		}
+	}
+
+	fn submit_work_block(&self, block: Bytes) -> Result<(), Error> {
+		let b: Block = decode(&block);
+		let mut sealing_work = self.sealing_work.lock();
+		sealing_work.queue.push(BlockEntry::Raw(b));
+		sealing_work.queue.use_last_ref();
+		Ok(())
 	}
 
 	fn call(&self, chain: &MiningBlockChainClient, t: &SignedTransaction, analytics: CallAnalytics) -> Result<Executed, CallError> {
 		let sealing_work = self.sealing_work.lock();
-		match sealing_work.queue.peek_last_ref() {
+		match sealing_work.queue.peek_last_ref().and_then(|b| b.as_closed()) {
 			Some(work) => {
 				let block = work.block();
 
@@ -517,7 +559,7 @@ impl MinerService for Miner {
 
 	fn balance(&self, chain: &MiningBlockChainClient, address: &Address) -> U256 {
 		let sealing_work = self.sealing_work.lock();
-		sealing_work.queue.peek_last_ref().map_or_else(
+		sealing_work.queue.peek_last_ref().and_then(|b| b.as_closed()).map_or_else(
 			|| chain.latest_balance(address),
 			|b| b.block().fields().state.balance(address)
 		)
@@ -525,7 +567,7 @@ impl MinerService for Miner {
 
 	fn storage_at(&self, chain: &MiningBlockChainClient, address: &Address, position: &H256) -> H256 {
 		let sealing_work = self.sealing_work.lock();
-		sealing_work.queue.peek_last_ref().map_or_else(
+		sealing_work.queue.peek_last_ref().and_then(|b| b.as_closed()).map_or_else(
 			|| chain.latest_storage_at(address, position),
 			|b| b.block().fields().state.storage_at(address, position)
 		)
@@ -533,12 +575,12 @@ impl MinerService for Miner {
 
 	fn nonce(&self, chain: &MiningBlockChainClient, address: &Address) -> U256 {
 		let sealing_work = self.sealing_work.lock();
-		sealing_work.queue.peek_last_ref().map_or_else(|| chain.latest_nonce(address), |b| b.block().fields().state.nonce(address))
+		sealing_work.queue.peek_last_ref().and_then(|b| b.as_closed()).map_or_else(|| chain.latest_nonce(address), |b| b.block().fields().state.nonce(address))
 	}
 
 	fn code(&self, chain: &MiningBlockChainClient, address: &Address) -> Option<Bytes> {
 		let sealing_work = self.sealing_work.lock();
-		sealing_work.queue.peek_last_ref().map_or_else(|| chain.latest_code(address), |b| b.block().fields().state.code(address).map(|c| (*c).clone()))
+		sealing_work.queue.peek_last_ref().and_then(|b| b.as_closed()).map_or_else(|| chain.latest_code(address), |b| b.block().fields().state.code(address).map(|c| (*c).clone()))
 	}
 
 	fn set_author(&self, author: Address) {
@@ -693,7 +735,7 @@ impl MinerService for Miner {
 		};
 		match (&self.options.pending_set, sealing_set) {
 			(&PendingSet::AlwaysQueue, _) | (&PendingSet::SealingOrElseQueue, None) => queue.top_transactions(),
-			(_, sealing) => sealing.map_or_else(Vec::new, |s| s.transactions().to_owned()),
+			(_, sealing) => sealing.and_then(|b| b.as_closed()).map_or_else(Vec::new, |s| s.transactions().to_owned()),
 		}
 	}
 
@@ -706,7 +748,7 @@ impl MinerService for Miner {
 		};
 		match (&self.options.pending_set, sealing_set) {
 			(&PendingSet::AlwaysQueue, _) | (&PendingSet::SealingOrElseQueue, None) => queue.pending_hashes(),
-			(_, sealing) => sealing.map_or_else(Vec::new, |s| s.transactions().iter().map(|t| t.hash()).collect()),
+			(_, sealing) => sealing.and_then(|b| b.as_closed()).map_or_else(Vec::new, |s| s.transactions().iter().map(|t| t.hash()).collect()),
 		}
 	}
 
@@ -719,13 +761,13 @@ impl MinerService for Miner {
 		};
 		match (&self.options.pending_set, sealing_set) {
 			(&PendingSet::AlwaysQueue, _) | (&PendingSet::SealingOrElseQueue, None) => queue.find(hash),
-			(_, sealing) => sealing.and_then(|s| s.transactions().iter().find(|t| &t.hash() == hash).cloned()),
+			(_, sealing) => sealing.and_then(|b| b.as_closed()).and_then(|s| s.transactions().iter().find(|t| &t.hash() == hash).cloned()),
 		}
 	}
 
 	fn pending_receipt(&self, hash: &H256) -> Option<RichReceipt> {
 		let sealing_work = self.sealing_work.lock();
-		match (sealing_work.enabled, sealing_work.queue.peek_last_ref()) {
+		match (sealing_work.enabled, sealing_work.queue.peek_last_ref().and_then(|b| b.as_closed())) {
 			(true, Some(pending)) => {
 				let txs = pending.transactions();
 				txs.iter()
@@ -754,7 +796,7 @@ impl MinerService for Miner {
 
 	fn pending_receipts(&self) -> BTreeMap<H256, Receipt> {
 		let sealing_work = self.sealing_work.lock();
-		match (sealing_work.enabled, sealing_work.queue.peek_last_ref()) {
+		match (sealing_work.enabled, sealing_work.queue.peek_last_ref().and_then(|b| b.as_closed())) {
 			(true, Some(pending)) => {
 				let hashes = pending.transactions()
 					.iter()
@@ -817,33 +859,44 @@ impl MinerService for Miner {
 		self.sealing_work.lock().queue.is_in_use()
 	}
 
-	fn map_sealing_work<F, T>(&self, chain: &MiningBlockChainClient, f: F) -> Option<T> where F: FnOnce(&ClosedBlock) -> T {
+	fn map_sealing_work<F, T>(&self, chain: &MiningBlockChainClient, f: F) -> Option<T> where F: FnOnce(&Block) -> T {
 		trace!(target: "miner", "map_sealing_work: entering");
 		self.enable_and_prepare_sealing(chain);
 		trace!(target: "miner", "map_sealing_work: sealing prepared");
 		let mut sealing_work = self.sealing_work.lock();
 		let ret = sealing_work.queue.use_last_ref();
-		trace!(target: "miner", "map_sealing_work: leaving use_last_ref={:?}", ret.as_ref().map(|b| b.block().fields().header.hash()));
-		ret.map(f)
+		trace!(target: "miner", "map_sealing_work: leaving use_last_ref={:?}", ret.as_ref().and_then(|b| b.as_closed()).map(|b| b.block().fields().header.hash()));
+		ret.map(|b| f(b.as_block()))
 	}
 
 	fn submit_seal(&self, chain: &MiningBlockChainClient, pow_hash: H256, seal: Vec<Bytes>) -> Result<(), Error> {
-		let result = if let Some(b) = self.sealing_work.lock().queue.get_used_if(if self.options.enable_resubmission { GetAction::Clone } else { GetAction::Take }, |b| &b.hash() == &pow_hash) {
-			b.lock().try_seal(&*self.engine, seal).or_else(|_| {
-				warn!(target: "miner", "Mined solution rejected: Invalid.");
-				Err(Error::PowInvalid)
-			})
+		let block = { self.sealing_work.lock().queue.get_used_if(if self.options.enable_resubmission { GetAction::Clone } else { GetAction::Take }, |b| &b.hash() == &pow_hash) };
+		if let Some(b) = block {
+			match b {
+				BlockEntry::Closed(b) => {
+					let sealed = try!(b.lock().try_seal(&*self.engine, seal).or_else(|_| {
+						warn!(target: "miner", "Mined solution rejected: Invalid.");
+						Err(Error::PowInvalid)
+					}));
+					let n = sealed.header().number();
+					let h = sealed.header().hash();
+					try!(chain.import_sealed_block(sealed));
+					info!(target: "miner", "Mined block imported OK. #{}: {}", Colour::White.bold().paint(format!("{}", n)), Colour::White.bold().paint(h.hex()));
+					Ok(())
+				},
+				BlockEntry::Raw(mut b) => {
+					b.header.set_seal(seal);
+					let n = b.header.number();
+					let h = b.header.hash();
+					try!(chain.import_verified_block(b));
+					info!(target: "miner", "Mined block template imported OK. #{}: {}", Colour::White.bold().paint(format!("{}", n)), Colour::White.bold().paint(h.hex()));
+					Ok(())
+				}
+			}
 		} else {
 			warn!(target: "miner", "Mined solution rejected: Block unknown or out of date.");
 			Err(Error::PowHashInvalid)
-		};
-		result.and_then(|sealed| {
-			let n = sealed.header().number();
-			let h = sealed.header().hash();
-			try!(chain.import_sealed_block(sealed));
-			info!(target: "miner", "Mined block imported OK. #{}: {}", Colour::White.bold().paint(format!("{}", n)), Colour::White.bold().paint(h.hex()));
-			Ok(())
-		})
+		}
 	}
 
 	fn chain_new_blocks(&self, chain: &MiningBlockChainClient, _imported: &[H256], _invalid: &[H256], enacted: &[H256], retracted: &[H256]) {

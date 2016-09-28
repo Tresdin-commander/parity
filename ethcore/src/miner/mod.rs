@@ -55,7 +55,7 @@ pub use client::TransactionImportResult;
 use std::collections::BTreeMap;
 use util::{H256, U256, Address, Bytes};
 use client::{MiningBlockChainClient, Executed, CallAnalytics};
-use block::ClosedBlock;
+use block::Block;
 use receipt::{RichReceipt, Receipt};
 use error::{Error, CallError};
 use transaction::SignedTransaction;
@@ -132,7 +132,7 @@ pub trait MinerService : Send + Sync {
 
 	/// Get the sealing work package and if `Some`, apply some transform.
 	fn map_sealing_work<F, T>(&self, chain: &MiningBlockChainClient, f: F) -> Option<T>
-		where F: FnOnce(&ClosedBlock) -> T, Self: Sized;
+		where F: FnOnce(&Block) -> T, Self: Sized;
 
 	/// Query pending transactions for hash.
 	fn transaction(&self, hash: &H256) -> Option<SignedTransaction>;
@@ -175,6 +175,9 @@ pub trait MinerService : Send + Sync {
 
 	/// Get contract code in pending state.
 	fn code(&self, chain: &MiningBlockChainClient, address: &Address) -> Option<Bytes>;
+
+	/// Submut work block without seal to the queue.
+	fn submit_work_block(&self, block: Bytes) -> Result<(), Error>;
 }
 
 /// Mining status

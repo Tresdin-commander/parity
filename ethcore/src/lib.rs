@@ -124,6 +124,7 @@ pub mod migrations;
 pub mod miner;
 pub mod snapshot;
 pub mod action_params;
+pub use basic_types::Seal;
 #[macro_use] pub mod evm;
 
 mod cache_manager;

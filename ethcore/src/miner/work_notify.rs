@@ -24,7 +24,28 @@ use hyper::net::HttpStream;
 use ethash::SeedHashCompute;
 use hyper::Url;
 use util::*;
+use basic_types::*;
 use ethereum::ethash::Ethash;
+use std::net::{UdpSocket, SocketAddrV4};
+use header::Header;
+
+pub struct UdpPoster {
+	udp_socket: UdpSocket,
+	dest_addr: SocketAddrV4,
+}
+
+impl UdpPoster {
+	pub fn new() -> Self {
+		UdpPoster {
+			dest_addr: FromStr::from_str("127.0.0.1:8545").unwrap(),
+			udp_socket: UdpSocket::bind("127.0.0.1:30203").unwrap(),
+		}
+	}
+
+	pub fn notify(&self, header: &Header) {
+		self.udp_socket.send_to(&header.rlp(Seal::Without), &self.dest_addr).ok();
+	}
+}
 
 pub struct WorkPoster {
 	urls: Vec<Url>,

@@ -21,7 +21,7 @@ use util::numbers::U256;
 use util::Itertools;
 use blockchain::TreeRoute;
 use block_queue::BlockQueueInfo;
-use block::{OpenBlock, SealedBlock};
+use block::{OpenBlock, SealedBlock, Block};
 use header::{BlockNumber};
 use transaction::{LocalizedTransaction, SignedTransaction};
 use log_entry::LocalizedLogEntry;
@@ -228,6 +228,9 @@ pub trait MiningBlockChainClient : BlockChainClient {
 
 	/// Import sealed block. Skips all verifications.
 	fn import_sealed_block(&self, block: SealedBlock) -> ImportResult;
+
+	/// Import block with verification.
+	fn import_verified_block(&self, block: Block) -> ImportResult;
 }
 
 impl IpcConfig for BlockChainClient { }

@@ -20,7 +20,7 @@ use util::{Address, H256, Bytes, U256, FixedHash, Uint};
 use util::standard::*;
 use ethcore::error::{Error, CallError};
 use ethcore::client::{MiningBlockChainClient, Executed, CallAnalytics};
-use ethcore::block::{ClosedBlock, IsBlock};
+use ethcore::block::{ClosedBlock, IsBlock, Block};
 use ethcore::transaction::SignedTransaction;
 use ethcore::receipt::{Receipt, RichReceipt};
 use ethcore::miner::{MinerService, MinerStatus, TransactionImportResult};
@@ -73,6 +73,10 @@ impl MinerService for TestMinerService {
 			transactions_in_future_queue: 0,
 			transactions_in_pending_block: 1
 		}
+	}
+
+	fn submit_work_block(&self, _block: Bytes) -> Result<(), Error> {
+		Ok(())
 	}
 
 	fn set_author(&self, author: Address) {
@@ -181,9 +185,9 @@ impl MinerService for TestMinerService {
 		unimplemented!();
 	}
 
-	fn map_sealing_work<F, T>(&self, chain: &MiningBlockChainClient, f: F) -> Option<T> where F: FnOnce(&ClosedBlock) -> T {
+	fn map_sealing_work<F, T>(&self, chain: &MiningBlockChainClient, f: F) -> Option<T> where F: FnOnce(&Block) -> T {
 		let open_block = chain.prepare_open_block(self.author(), *self.gas_range_target.write(), self.extra_data());
-		Some(f(&open_block.close()))
+		Some(f(&open_block.close().base()))
 	}
 
 	fn transaction(&self, hash: &H256) -> Option<SignedTransaction> {

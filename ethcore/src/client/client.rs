@@ -1105,6 +1105,44 @@ impl MiningBlockChainClient for Client {
 		self.db.flush().expect("DB flush failed.");
 		Ok(h)
 	}
+
+	fn import_verified_block(&self, block: Block) -> ImportResult {
+		let _import_lock = self.import_lock.lock();
+		let start = precise_time_ns();
+		let h = block.header.hash();
+		let number = block.header.number();
+		let block_data = block.rlp_bytes(Seal::With);
+		let verified_block = PreverifiedBlock {
+			header: block.header,
+			transactions: block.transactions,
+			bytes: block_data,
+		};
+		let closed_block = self.check_and_close_block(&verified_block);
+		if let Err(_) = closed_block {
+			return Ok(H256::new());
+		}
+
+		let closed_block = closed_block.unwrap();
+		let route = self.commit_block(closed_block, &h, &verified_block.bytes);
+
+		trace!(target: "client", "Imported verified block #{} ({})", number, h);
+
+		let (enacted, retracted) = self.calculate_enacted_retracted(&[route]);
+		self.miner.chain_new_blocks(self, &[h.clone()], &[], &enacted, &retracted);
+
+		self.notify(|notify| {
+			notify.new_blocks(
+				vec![h.clone()],
+				vec![],
+				enacted.clone(),
+				retracted.clone(),
+				vec![h.clone()],
+				precise_time_ns() - start,
+			);
+		});
+		self.db.flush().expect("DB flush failed.");
+		Ok(h)
+	}
 }
 
 impl MayPanic for Client {

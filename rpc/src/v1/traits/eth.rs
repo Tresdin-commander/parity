@@ -122,6 +122,12 @@ pub trait Eth: Sized + Send + Sync + 'static {
 	/// Used for submitting a proof-of-work solution.
 	fn submit_work(&self, _: Params) -> Result<Value, Error>;
 
+	/// Returns the block template
+	fn block_template(&self, _: Params) -> Result<Value, Error>;
+
+	/// Set the block template into miner
+	fn submit_block_template(&self, _: Params) -> Result<Value, Error>;
+
 	/// Used for submitting mining hashrate.
 	fn submit_hashrate(&self, _: Params) -> Result<Value, Error>;
 
@@ -163,6 +169,8 @@ pub trait Eth: Sized + Send + Sync + 'static {
 		delegate.add_method("eth_getWork", Eth::work);
 		delegate.add_method("eth_submitWork", Eth::submit_work);
 		delegate.add_method("eth_submitHashrate", Eth::submit_hashrate);
+		delegate.add_method("eth_getBlockTemplate", Eth::block_template);
+		delegate.add_method("eth_submitBlockTemplate", Eth::submit_block_template);
 		delegate
 	}
 }
