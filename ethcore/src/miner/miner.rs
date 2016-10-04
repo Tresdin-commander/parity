@@ -404,7 +404,7 @@ impl Miner {
 			trace!(target: "miner", "Checking whether we need to reseal: orig={:?} last={:?}, this={:?}", original_work_hash, last_work_hash, block.block().fields().header.hash());
 			let (work, is_new) = if last_work_hash.map_or(true, |h| h != block.block().fields().header.hash()) {
 				trace!(target: "miner", "Pushing a new, refreshed or borrowed pending {}...", block.block().fields().header.hash());
-				let pow_hash = block.block().fields().header.hash();
+				let header = block.block().fields().header.clone();
 				let number = block.block().fields().header.number();
 				let difficulty = *block.block().fields().header.difficulty();
 				let is_new = original_work_hash.map_or(true, |h| block.block().fields().header.hash() != h);
@@ -413,15 +413,15 @@ impl Miner {
 				if is_new {
 					sealing_work.queue.use_last_ref();
 				}
-				(Some((pow_hash, difficulty, number)), is_new)
+				(Some((header, difficulty, number)), is_new)
 			} else {
 				(None, false)
 			};
 			(work, is_new)
 		};
 		if is_new {
-			work.map(|(pow_hash, _, _)| self.udp_poster.notify(pow_hash.clone()));
-			work.map(|(pow_hash, difficulty, number)| self.work_poster.as_ref().map(|ref p| p.notify(pow_hash, difficulty, number)));
+			work.as_ref().map(|&(ref header, _, _)| self.udp_poster.notify(&header));
+			work.map(|(header, difficulty, number)| self.work_poster.as_ref().map(|ref p| p.notify(header.hash(), difficulty, number)));
 		}
 	}
 
@@ -506,13 +506,8 @@ impl MinerService for Miner {
 	fn submit_work_block(&self, block: Bytes) -> Result<(), Error> {
 		let b: Block = decode(&block);
 		let mut sealing_work = self.sealing_work.lock();
-		let pow_hash = b.header.hash();
-		let difficulty = b.header.difficulty().clone();
-		let number = b.header.number();
 		sealing_work.queue.push(BlockEntry::Raw(b));
 		sealing_work.queue.use_last_ref();
-		self.udp_poster.notify(pow_hash.clone());
-		self.work_poster.as_ref().map(|ref p| p.notify(pow_hash, difficulty, number));
 		Ok(())
 	}
 

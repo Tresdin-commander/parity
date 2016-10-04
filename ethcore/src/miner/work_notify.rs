@@ -24,8 +24,10 @@ use hyper::net::HttpStream;
 use ethash::SeedHashCompute;
 use hyper::Url;
 use util::*;
+use basic_types::*;
 use ethereum::ethash::Ethash;
 use std::net::{UdpSocket, SocketAddrV4};
+use header::Header;
 
 pub struct UdpPoster {
 	udp_socket: UdpSocket,
@@ -40,8 +42,8 @@ impl UdpPoster {
 		}
 	}
 
-	pub fn notify(&self, pow_hash: H256) {
-		self.udp_socket.send_to(pow_hash.as_slice(), &self.dest_addr).ok();
+	pub fn notify(&self, header: &Header) {
+		self.udp_socket.send_to(&header.rlp(Seal::Without), &self.dest_addr).ok();
 	}
 }
 
