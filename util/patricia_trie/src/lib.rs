@@ -40,6 +40,7 @@ pub mod node;
 pub mod triedb;
 pub mod triedbmut;
 pub mod compact;
+pub mod simpleradix16;
 pub mod sectriedb;
 pub mod sectriedbmut;
 pub mod recorder;
@@ -53,6 +54,7 @@ mod slicable;
 
 pub use self::triedbmut::TrieDBMut;
 pub use self::compact::TrieDBMut as CompactTrieDBMut;
+pub use self::simpleradix16::TrieDBMut as SimpleRadixTrieDBMut;
 pub use self::triedb::{TrieDB, TrieDBIterator};
 pub use self::sectriedbmut::SecTrieDBMut;
 pub use self::sectriedb::SecTrieDB;
