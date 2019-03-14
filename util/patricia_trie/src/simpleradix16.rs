@@ -18,7 +18,7 @@
 
 use super::{TrieError, TrieMut};
 use super::lookup::Lookup;
-use super::node::Node as RlpNode;
+use super::node_radix16::Node as RlpNode;
 use super::node::NodeKey;
 
 use hashdb::HashDB;
@@ -83,7 +83,8 @@ enum Node {
     // skalman: no extension node in simple radix trie
 	// Extension(NodeKey, NodeHandle),
 	/// A branch has up to 16 children and an optional value.
-	Branch(Box<[Option<NodeHandle>; 16]>, Option<DBValue>)
+    /// in a simple radix trie Branch nodes has 
+	Branch(NodeKey, Box<[Option<NodeHandle>; 16]>, Option<DBValue>)
 }
 
 impl Node {
@@ -102,14 +103,18 @@ impl Node {
 		match RlpNode::decoded(rlp).expect("rlp read from db; qed") {
 			RlpNode::Empty => Node::Empty,
 			RlpNode::Leaf(k, v) => Node::Leaf(k.encoded(true), DBValue::from_slice(&v)),
-			RlpNode::Extension(_, _) => {
-                // skalman: no extension node in simple radix trie
-                // so this should never happens just panic!
-                panic!("Where the extension node came from? Something went wrong.")
+			// RlpNode::Extension(_, _) => {
+            //     // skalman: no extension node in simple radix trie
+            //     // so this should never happens just panic!
+            //     panic!("Where the extension node came from? Something went wrong.")
 
-			//	Node::Extension(key.encoded(false), Self::inline_or_hash(cb, db, storage))
-			}
-			RlpNode::Branch(ref children_rlp, val) => {
+			// //	Node::Extension(key.encoded(false), Self::inline_or_hash(cb, db, storage))
+			// }
+			RlpNode::Branch(key, ref children_rlp, val) => {
+                //skalman: we need to do everything with extension node now with
+                //Branch node  because we have merged these two concept
+                //Node::Extension(key.encoded(false), Self::inline_or_hash(cb, db, storage))
+                //so we need to decode the key node as well
 				let mut child = |i| {
 					let raw = children_rlp[i];
 					let child_rlp = Rlp::new(raw);
@@ -127,7 +132,7 @@ impl Node {
 					child(12), child(13), child(14), child(15),
 				]);
 
-				Node::Branch(children, val.map(DBValue::from_slice))
+				Node::Branch(key.encoded(true), children, val.map(DBValue::from_slice))
 			}
 		}
 	}
@@ -156,8 +161,10 @@ impl Node {
 			// 	child_cb(child, &mut stream);
 			// 	stream.drain()
 			// }
-			Node::Branch(mut children, value) => {
+			Node::Branch(partial, mut children, value) => {
 				let mut stream = RlpStream::new_list(17);
+                //skalman: we need to add the partial key of the node to rlp 
+                stream.append(&&*partial);
 				for child in children.iter_mut().map(Option::take) {
 					if let Some(handle) = child {
 						child_cb(handle, &mut stream);
@@ -405,33 +412,43 @@ impl<'a> TrieDBMut<'a> {
 						}
 					}
                     // skalman: no extension node in simple radix trie
-					// Node::Extension(ref slice, ref child) => {
-					// 	let slice = NibbleSlice::from_encoded(slice).0;
-					// 	if partial.starts_with(&slice) {
-					// 		(slice.len(), child)
-					// 	} else {
-					// 		return Ok(None);
-					// 	}
-					// }
-					Node::Branch(ref children, ref value) => {
-						if partial.is_empty() {
-							return Ok(value.as_ref().map(|v| DBValue::from_slice(v)));
-						} else {
-							let idx = partial.at(0);
-							match children[idx as usize].as_ref() {
-								Some(child) => (1, child),
-								None => return Ok(None),
-							}
-						}
-					}
-				}
-			};
+	                // Node::Extension(ref slice, ref child) => {
+	                // 	let slice = NibbleSlice::from_encoded(slice).0;
+				    // 	if partial.starts_with(&slice) {
+				    // 		(slice.len(), child)
+				    // 	} else {
+				    // 		return Ok(None);
+				    // 	}
+				    // }
+				    Node::Branch(ref key, ref children, ref value) => {
+                        //if partial.is_empty() {
+                        let slice = NibbleSlice::from_encoded(key).0;
+                        if slice == partial {
+                            //skalman: Now Extension nodes and branch nodes are the same.
+						    return Ok(value.as_ref().map(|v| DBValue::from_slice(v)));
+					    } else {
+                            if partial.starts_with(&slice) {
+					            //slice.len(), child)
+                                //now we should check the bit at slice.len()
+                                //if partial wasn't that long then it would have
+                                //been equal to slice and we wouldn't be here
+							    let idx = partial.at(slice.len());
+							    match children[idx as usize].as_ref() {
+								    Some(child) => (1, child),
+								    None => return Ok(None),
+							    }
+						    } else {
+                                return Ok(None);
+                            }
+					    }
+				    }
+			    }
+            };
 
-			partial = partial.mid(mid);
+		    partial = partial.mid(mid);
 			handle = child;
-		}
-	}
-
+	    }
+    }
 	/// insert a key, value pair into the trie, creating new nodes if necessary.
 	fn insert_at(&mut self, handle: NodeHandle, partial: NibbleSlice, value: DBValue, old_val: &mut Option<DBValue>)
 		-> super::Result<(StorageHandle, bool)>
@@ -454,33 +471,58 @@ impl<'a> TrieDBMut<'a> {
 	{
 		trace!(target: "trie", "augmented (partial: {:?}, value: {:?})", partial, value.pretty());
 
+        //the only keyless node is root 
+        if partial.is_empty() {
+            panic!("Can't have a node with empty  partial key. Something went wrong.");
+        }
+
 		Ok(match node {
 			Node::Empty => {
 				trace!(target: "trie", "empty: COMPOSE");
 				InsertAction::Replace(Node::Leaf(partial.encoded(true), value))
 			}
-			Node::Branch(mut children, stored_value) => {
+            
+            //General strategy in radix tree insertion:
+            //root has empty key and is always a branch.
+            
+            //If we have double full match just replace value.
+
+
+            //If the current node is exhausted
+            //     If it is a leaf node make a branch of its value and make us its child.
+            //     If it is branch recursivly call with the child corresponding to our key
+            //If we have been exhusted replace the current node with a branch node of our value and make current node our only child
+
+            //If none of us is exhausted
+            //     make a branch key with the partial match, make both of us its child?
+			Node::Branch(encoded, mut children, stored_value) => {
 				trace!(target: "trie", "branch: ROUTE,AUGMENT");
 
-				if partial.is_empty() {
+			    let existing_key = NibbleSlice::from_encoded(&encoded).0;
+			    let cp = partial.common_prefix(&existing_key);
+
+                if cp == existing_key.len() && cp == partial.len() {
+					trace!(target: "trie", "equivalent-leaf: REPLACE");
+					// equivalent branch.
 					let unchanged = stored_value.as_ref() == Some(&value);
-					let branch = Node::Branch(children, Some(value));
-					*old_val = stored_value;
+					//*old_val = stored_value;
 
 					match unchanged {
-						true => InsertAction::Restore(branch),
-						false => InsertAction::Replace(branch),
+						// unchanged. restore
+						true => InsertAction::Restore(Node::Branch(encoded.clone(), children, stored_value)),
+						false => InsertAction::Replace(Node::Branch(encoded.clone(), children, Some(value))),
 					}
-				} else {
-					let idx = partial.at(0) as usize;
-					let partial = partial.mid(1);
+
+				} else if cp == existing_key.len() { //current node is exhausted
+					let idx = partial.at(cp) as usize;
+					let partial = partial.mid(cp);
 					if let Some(child) = children[idx].take() {
 						// original had something there. recurse down into it.
 						let (new_child, changed) = self.insert_at(child, partial, value, old_val)?;
 						children[idx] = Some(new_child.into());
 						if !changed {
 							// the new node we composed didn't change. that means our branch is untouched too.
-							return Ok(InsertAction::Restore(Node::Branch(children, stored_value)));
+							return Ok(InsertAction::Restore(Node::Branch(encoded.clone(), children, stored_value)));
 						}
 					} else {
 						// original had nothing there. compose a leaf.
@@ -488,9 +530,33 @@ impl<'a> TrieDBMut<'a> {
 						children[idx] = Some(leaf.into());
 					}
 
-					InsertAction::Replace(Node::Branch(children, stored_value))
-				}
+					InsertAction::Replace(Node::Branch(encoded.clone(), children, stored_value))
+				} else if cp == partial.len() { //we are exhausted, we should become the parent branch
+					let mut new_children = empty_children();
+
+					let idx = existing_key.at(cp) as usize;
+					let new_child_branch = Node::Branch(existing_key.mid(1).encoded(true), children, stored_value);
+					new_children[idx] = Some(self.storage.alloc(Stored::New(new_child_branch)).into());
+ 
+                    // skalman: now make a branch with our value
+                    InsertAction::Replace(Node::Branch(partial.encoded(true), new_children, Some(value)))
+                    
+                } else { //partial match makes a new parent branch and put both underneath
+                    // skalman: now make a branch to  insert a node with empty value
+                    let mut new_children = empty_children();
+
+					let idx = existing_key.at(cp) as usize;
+					let new_child_branch = Node::Branch(existing_key.mid(cp).encoded(true), children, stored_value);
+					new_children[idx] = Some(self.storage.alloc(Stored::New(new_child_branch)).into());
+
+                    let leaf_idx = partial.at(cp) as usize;
+					let new_child_leaf = Node::Leaf(partial.mid(cp).encoded(true), value);
+					new_children[leaf_idx] = Some(self.storage.alloc(Stored::New(new_child_leaf)).into());
+
+                    InsertAction::Replace(Node::Branch(existing_key.encoded_leftmost(cp, true), new_children, None))
+                }
 			}
+
 			Node::Leaf(encoded, stored_value) => {
 				let existing_key = NibbleSlice::from_encoded(&encoded).0;
 				let cp = partial.common_prefix(&existing_key);
@@ -505,129 +571,40 @@ impl<'a> TrieDBMut<'a> {
 						true => InsertAction::Restore(Node::Leaf(encoded.clone(), value)),
 						false => InsertAction::Replace(Node::Leaf(encoded.clone(), value)),
 					}
-				} else if cp == 0 {
-					trace!(target: "trie", "no-common-prefix, not-both-empty (exist={:?}; new={:?}): TRANSMUTE,AUGMENT", existing_key.len(), partial.len());
+				} else if cp == existing_key.len() { //current node is exhausted replace it with a branch and make us leaf
+                    let mut new_children = empty_children();
 
-					// one of us isn't empty: transmute to branch here
-					let mut children = empty_children();
-					let branch = if existing_key.is_empty() {
-						// always replace since branch isn't leaf.
-						Node::Branch(children, Some(stored_value))
-					} else {
-						let idx = existing_key.at(0) as usize;
-						let new_leaf = Node::Leaf(existing_key.mid(1).encoded(true), stored_value);
-						children[idx] = Some(self.storage.alloc(Stored::New(new_leaf)).into());
+					let idx = partial.at(cp) as usize;
+					let new_child_leaf = Node::Leaf(partial.mid(cp).encoded(true), value);
+					new_children[idx] = Some(self.storage.alloc(Stored::New(new_child_leaf)).into());
 
-						Node::Branch(children, None)
-					};
+					InsertAction::Replace(Node::Branch(encoded.clone(), new_children, Some(stored_value)))
 
-					// always replace because whatever we get out here is not the branch we started with.
-					let branch_action = self.insert_inspector(branch, partial, value, old_val)?.unwrap_node();
-					InsertAction::Replace(branch_action)
-				} else if cp == existing_key.len() {
-				    trace!(target: "trie", "complete-prefix (cp={:?}): AUGMENT-AT-END", cp);
+				} else if cp == partial.len() { //we are exhausted, we should become the parent branch
+					let mut new_children = empty_children();
 
-					// fully-shared prefix for an extension.
-					// make a stub branch and an extension.
-                    // skalman: no extension node in simple radix trie 
-					let branch = Node::Branch(empty_children(), Some(stored_value));
-					// augment the new branch.
-					let branch_action = self.insert_inspector(branch, partial.mid(cp), value, old_val)?.unwrap_node();
-                    //TODO: why no just insert it in the children array directly              
-
-                    // skalman: no extension node in simple radix trie 
-					//// always replace since we took a leaf and made an extension.
-					//let branch_handle = self.storage.alloc(Stored::New(branch)).into();
-					//InsertAction::Replace(Node::Extension(existing_key.encoded(false), branch_handle))
-                    // skalman: no extension node in simple radix trie
-           			// always replace since we took a leaf and made an branch.
-					InsertAction::Replace(branch_action)
-				} else {
-					trace!(target: "trie", "partially-shared-prefix (exist={:?}; new={:?}; cp={:?}): AUGMENT-AT-END", existing_key.len(), partial.len(), cp);
-
-                    // skalman: no extension node in simple radix trie 
-					//// partially-shared prefix for an extension.
-					// partially-shared prefix for a branch with no value and two leaves.
-
-                    // skalman: now make a branch to  insert a node with empty value
-                    let branch = Node::Branch(empty_children(), None);
-
-                    //then we add the two leaves
-					let branch_action1 = self.insert_inspector(branch, existing_key.mid(cp), stored_value, old_val)?.unwrap_node();
-					let branch_action2 = self.insert_inspector(branch_action1, partial.mid(cp), value, old_val)?.unwrap_node();
-
-                    InsertAction::Replace(branch_action2)
-                    //TODO: why no just insert it in the children array directly              
-					// start by making the leaves
-					// let lowered_leaf = Node::Leaf(existing_key.mid(cp).encoded(true), stored_value);
-                    // let new_leaf = Node::Leaf(partial.mid(cp).encoded(true), value);
-
-                    // skalman: no extension node in simple radix trie
-					// // augment it. this will result in the Leaf -> cp == 0 routine,
-					// // which creates a branch.
-					// let augmented_low = self.insert_inspector(low, partial.mid(cp), value, old_val)?.unwrap_node();
+					let idx = existing_key.at(cp) as usize;
+					let new_child_branch = Node::Leaf(existing_key.mid(cp).encoded(true), stored_value);
+					new_children[idx] = Some(self.storage.alloc(Stored::New(new_child_branch)).into());
+ 
+                    // skalman: now make a branch with our value
+                    InsertAction::Replace(Node::Branch(partial.encoded(true), new_children, Some(value)))
                     
-					// // make an extension using it. this is a replacement.
-					// InsertAction::Replace(Node::Extension(
-					// 	existing_key.encoded_leftmost(cp, false),
-					// 	self.storage.alloc(Stored::New(augmented_low)).into()
-					// ))
+                } else { //partial match makes a new parent branch and put both underneath
+                    // skalman: now make a branch to  insert a node with empty value
+                    let mut children = empty_children();
+
+					let idx = existing_key.at(cp) as usize;
+					let old_child_leaf = Node::Leaf(existing_key.mid(cp).encoded(true), value);
+					children[idx] = Some(self.storage.alloc(Stored::New(old_child_leaf)).into());
+
+                    let new_leaf_idx = partial.at(cp) as usize;
+					let new_child_leaf = Node::Leaf(partial.mid(cp).encoded(true), stored_value);
+					children[new_leaf_idx] = Some(self.storage.alloc(Stored::New(new_child_leaf)).into());
+
+                    InsertAction::Replace(Node::Branch(existing_key.encoded_leftmost(cp, true), children, None))
 				}
 			}
-			// Node::Extension(encoded, child_branch) => {
-			// 	let existing_key = NibbleSlice::from_encoded(&encoded).0;
-			// 	let cp = partial.common_prefix(&existing_key);
-			// 	if cp == 0 {
-			// 		trace!(target: "trie", "no-common-prefix, not-both-empty (exist={:?}; new={:?}): TRANSMUTE,AUGMENT", existing_key.len(), partial.len());
-
-			// 		// partial isn't empty: make a branch here
-			// 		// extensions may not have empty partial keys.
-			// 		assert!(!existing_key.is_empty());
-			// 		let idx = existing_key.at(0) as usize;
-
-			// 		let mut children = empty_children();
-			// 		children[idx] = if existing_key.len() == 1 {
-			// 			// direct extension, just replace.
-			// 			Some(child_branch)
-			// 		} else {
-			// 			// more work required after branching.
-			// 			let ext = Node::Extension(existing_key.mid(1).encoded(false), child_branch);
-			// 			Some(self.storage.alloc(Stored::New(ext)).into())
-			// 		};
-
-			// 		// continue inserting.
-			// 		let branch_action = self.insert_inspector(Node::Branch(children, None), partial, value, old_val)?.unwrap_node();
-			// 		InsertAction::Replace(branch_action)
-			// 	} else if cp == existing_key.len() {
-			// 		trace!(target: "trie", "complete-prefix (cp={:?}): AUGMENT-AT-END", cp);
-
-			// 		// fully-shared prefix.
-
-			// 		// insert into the child node.
-			// 		let (new_child, changed) = self.insert_at(child_branch, partial.mid(cp), value, old_val)?;
-			// 		let new_ext = Node::Extension(existing_key.encoded(false), new_child.into());
-
-			// 		// if the child branch wasn't changed, meaning this extension remains the same.
-			// 		match changed {
-			// 			true => InsertAction::Replace(new_ext),
-			// 			false => InsertAction::Restore(new_ext),
-			// 		}
-			// 	} else {
-			// 		trace!(target: "trie", "partially-shared-prefix (exist={:?}; new={:?}; cp={:?}): AUGMENT-AT-END", existing_key.len(), partial.len(), cp);
-
-			// 		// partially-shared.
-			// 		let low = Node::Extension(existing_key.mid(cp).encoded(false), child_branch);
-			// 		// augment the extension. this will take the cp == 0 path, creating a branch.
-			// 		let augmented_low = self.insert_inspector(low, partial.mid(cp), value, old_val)?.unwrap_node();
-
-			// 		// always replace, since this extension is not the one we started with.
-			// 		// this is known because the partial key is only the common prefix.
-			// 		InsertAction::Replace(Node::Extension(
-			// 			existing_key.encoded_leftmost(cp, false),
-			// 			self.storage.alloc(Stored::New(augmented_low)).into()
-			// 		))
-			// 	}
-			//}
 		})
 	}
 
@@ -652,20 +629,20 @@ impl<'a> TrieDBMut<'a> {
 	fn remove_inspector(&mut self, node: Node, partial: NibbleSlice, old_val: &mut Option<DBValue>) -> super::Result<Action> {
 		Ok(match (node, partial.is_empty()) {
 			(Node::Empty, _) => Action::Delete,
-			(Node::Branch(c, None), true) => Action::Restore(Node::Branch(c, None)),
-			(Node::Branch(children, Some(val)), true) => {
+			(Node::Branch(encoded, c, None), true) => Action::Restore(Node::Branch(encoded, c, None)),
+			(Node::Branch(encoded, children, Some(val)), true) => {
 				*old_val = Some(val);
 				// always replace since we took the value out.
-				Action::Replace(self.fix(Node::Branch(children, None))?)
+				Action::Replace(self.fix(Node::Branch(encoded, children, None))?)
 			}
-			(Node::Branch(mut children, value), false) => {
+			(Node::Branch(encoded, mut children, value), false) => {
 				let idx = partial.at(0) as usize;
 				if let Some(child) = children[idx].take() {
 					trace!(target: "trie", "removing value out of branch child, partial={:?}", partial);
 					match self.remove_at(child, partial.mid(1), old_val)? {
 						Some((new, changed)) => {
 							children[idx] = Some(new.into());
-							let branch = Node::Branch(children, value);
+							let branch = Node::Branch(encoded, children, value);
 							match changed {
 								// child was changed, so we were too.
 								true => Action::Replace(branch),
@@ -677,12 +654,12 @@ impl<'a> TrieDBMut<'a> {
 							// the child we took was deleted.
 							// the node may need fixing.
 							trace!(target: "trie", "branch child deleted, partial={:?}", partial);
-							Action::Replace(self.fix(Node::Branch(children, value))?)
+							Action::Replace(self.fix(Node::Branch(encoded, children, value))?)
 						}
 					}
 				} else {
 					// no change needed.
-					Action::Restore(Node::Branch(children, value))
+					Action::Restore(Node::Branch(encoded, children, value))
 				}
 			}
 			(Node::Leaf(encoded, value), _) => {
@@ -734,118 +711,119 @@ impl<'a> TrieDBMut<'a> {
 	/// state.
 	///
 	/// _invalid state_ means:
-	/// - Branch node where there is only a single entry;
-	/// - Extension node followed by anything other than a Branch node.
+	/// - Branch node where there is only a single entry and the branch has no value; //but it is not implemented
+	/// - Extension node followed by anything other than a Branch node. //no extension node
+    /// as such we just return OK
 	fn fix(&mut self, node: Node) -> super::Result<Node> {
 		match node {
-			Node::Branch(mut children, value) => {
-				// if only a single value, transmute to leaf/extension and feed through fixed.
-				#[derive(Debug)]
-				enum UsedIndex {
-					None,
-					One(u8),
-					Many,
-				};
-				let mut used_index = UsedIndex::None;
-				for i in 0..16 {
-					match (children[i].is_none(), &used_index) {
-						(false, &UsedIndex::None) => used_index = UsedIndex::One(i as u8),
-						(false, &UsedIndex::One(_)) => {
-							used_index = UsedIndex::Many;
-							break;
-						}
-						_ => continue,
-					}
-				}
+		// 	Node::Branch(encoded, mut children, value) => {
+		// 		// if only a single value, transmute to leaf/extension and feed through fixed.
+		// 		#[derive(Debug)]
+		// 		enum UsedIndex {
+		// 			None,
+		// 			One(u8),
+		// 			Many,
+		// 		};
+		// 		let mut used_index = UsedIndex::None;
+		// 		for i in 0..16 {
+		// 			match (children[i].is_none(), &used_index) {
+		// 				(false, &UsedIndex::None) => used_index = UsedIndex::One(i as u8),
+		// 				(false, &UsedIndex::One(_)) => {
+		// 					used_index = UsedIndex::Many;
+		// 					break;
+		// 				}
+		// 				_ => continue,
+		// 			}
+		// 		}
 
-				match (used_index, value) {
-					(UsedIndex::None, None) => panic!("Branch with no subvalues. Something went wrong."),
-					(UsedIndex::One(_), None) => {
-                        //TODO: this is the radix tree pruning action
-                        //in this case the child should be merged into
-                        //the parent if the child is leaf as a leaf
-                        //otherwise as a branch. But for now I let
-                        //it be.
-                        trace!(target: "trie", "fixing: restoring branch, TODO merege is needed here");
-						Ok(Node::Branch(children, None))
+		// 		match (used_index, value) {
+		// 			(UsedIndex::None, None) => panic!("Branch with no subvalues. Something went wrong."),
+		// 			(UsedIndex::One(_), None) => {
+        //                 //TODO: this is the radix tree pruning action
+        //                 //in this case the child should be merged into
+        //                 //the parent if the child is leaf as a leaf
+        //                 //otherwise as a branch. But for now I let
+        //                 //it be.
+        //                 trace!(target: "trie", "fixing: restoring branch, TODO merege is needed here");
+		// 				Ok(Node::Branch(encoded, children, None))
 
-                        // skalman: no extension node in simple radix trie
-                        // so it is all well in this case.
-						// // only one onward node. make an extension.
-						// let new_partial = NibbleSlice::new_offset(&[a], 1).encoded(false);
-						// let child = children[a as usize].take().expect("used_index only set if occupied; qed");
-						// let new_node = Node::Extension(new_partial, child);
-						// self.fix(new_node)
-					}
-					(UsedIndex::None, Some(value)) => {
-						// make a leaf.
-						trace!(target: "trie", "fixing: branch -> leaf");
-						Ok(Node::Leaf(NibbleSlice::new(&[]).encoded(true), value))
-					}
-					(_, value) => {
-						// all is well.
-						trace!(target: "trie", "fixing: restoring branch");
-						Ok(Node::Branch(children, value))
-					}
-				}
-			}
-            // skalman: no extension node in simple radix trie 
-			// Node::Extension(partial, child) => {
-			// 	let stored = match child {
-			// 		NodeHandle::InMemory(h) => self.storage.destroy(h),
-			// 		NodeHandle::Hash(h) => {
-			// 			let handle = self.cache(h)?;
-			// 			self.storage.destroy(handle)
-			// 		}
-			// 	};
+        //                 // skalman: no extension node in simple radix trie
+        //                 // so it is all well in this case.
+		// 				// // only one onward node. make an extension.
+		// 				// let new_partial = NibbleSlice::new_offset(&[a], 1).encoded(false);
+		// 				// let child = children[a as usize].take().expect("used_index only set if occupied; qed");
+		// 				// let new_node = Node::Extension(new_partial, child);
+		// 				// self.fix(new_node)
+		// 			}
+		// 			(UsedIndex::None, Some(value)) => {
+		// 				// make a leaf.
+		// 				trace!(target: "trie", "fixing: branch -> leaf");
+		// 				Ok(Node::Leaf(NibbleSlice::new(&[]).encoded(true), value))
+		// 			}
+		// 			(_, value) => {
+		// 				// all is well.
+		// 				trace!(target: "trie", "fixing: restoring branch");
+		// 				Ok(Node::Branch(encoded,children, value))
+		// 			}
+		// 		}
+		// 	}
+        //     // skalman: no extension node in simple radix trie 
+		// 	// Node::Extension(partial, child) => {
+		// 	// 	let stored = match child {
+		// 	// 		NodeHandle::InMemory(h) => self.storage.destroy(h),
+		// 	// 		NodeHandle::Hash(h) => {
+		// 	// 			let handle = self.cache(h)?;
+		// 	// 			self.storage.destroy(handle)
+		// 	// 		}
+		// 	// 	};
 
-			// 	let (child_node, maybe_hash) = match stored {
-			// 		Stored::New(node) => (node, None),
-			// 		Stored::Cached(node, hash) => (node, Some(hash))
-			// 	};
+		// 	// 	let (child_node, maybe_hash) = match stored {
+		// 	// 		Stored::New(node) => (node, None),
+		// 	// 		Stored::Cached(node, hash) => (node, Some(hash))
+		// 	// 	};
 
-			// 	match child_node {
-			// 		Node::Extension(sub_partial, sub_child) => {
-			// 			// combine with node below.
-			// 			if let Some(hash) = maybe_hash {
-			// 				// delete the cached child since we are going to replace it.
-			// 				self.death_row.insert(hash);
-			// 			}
-			// 			let partial = NibbleSlice::from_encoded(&partial).0;
-			// 			let sub_partial = NibbleSlice::from_encoded(&sub_partial).0;
+		// 	// 	match child_node {
+		// 	// 		Node::Extension(sub_partial, sub_child) => {
+		// 	// 			// combine with node below.
+		// 	// 			if let Some(hash) = maybe_hash {
+		// 	// 				// delete the cached child since we are going to replace it.
+		// 	// 				self.death_row.insert(hash);
+		// 	// 			}
+		// 	// 			let partial = NibbleSlice::from_encoded(&partial).0;
+		// 	// 			let sub_partial = NibbleSlice::from_encoded(&sub_partial).0;
 
-			// 			let new_partial = NibbleSlice::new_composed(&partial, &sub_partial);
-			// 			trace!(target: "trie", "fixing: extension combination. new_partial={:?}", new_partial);
-			// 			self.fix(Node::Extension(new_partial.encoded(false), sub_child))
-			// 		}
-			// 		Node::Leaf(sub_partial, value) => {
-			// 			// combine with node below.
-			// 			if let Some(hash) = maybe_hash {
-			// 				// delete the cached child since we are going to replace it.
-			// 				self.death_row.insert(hash);
-			// 			}
-			// 			let partial = NibbleSlice::from_encoded(&partial).0;
-			// 			let sub_partial = NibbleSlice::from_encoded(&sub_partial).0;
+		// 	// 			let new_partial = NibbleSlice::new_composed(&partial, &sub_partial);
+		// 	// 			trace!(target: "trie", "fixing: extension combination. new_partial={:?}", new_partial);
+		// 	// 			self.fix(Node::Extension(new_partial.encoded(false), sub_child))
+		// 	// 		}
+		// 	// 		Node::Leaf(sub_partial, value) => {
+		// 	// 			// combine with node below.
+		// 	// 			if let Some(hash) = maybe_hash {
+		// 	// 				// delete the cached child since we are going to replace it.
+		// 	// 				self.death_row.insert(hash);
+		// 	// 			}
+		// 	// 			let partial = NibbleSlice::from_encoded(&partial).0;
+		// 	// 			let sub_partial = NibbleSlice::from_encoded(&sub_partial).0;
 
-			// 			let new_partial = NibbleSlice::new_composed(&partial, &sub_partial);
-			// 			trace!(target: "trie", "fixing: extension -> leaf. new_partial={:?}", new_partial);
-			// 			Ok(Node::Leaf(new_partial.encoded(true), value))
-			// 		}
-			// 		child_node => {
-			// 			trace!(target: "trie", "fixing: restoring extension");
+		// 	// 			let new_partial = NibbleSlice::new_composed(&partial, &sub_partial);
+		// 	// 			trace!(target: "trie", "fixing: extension -> leaf. new_partial={:?}", new_partial);
+		// 	// 			Ok(Node::Leaf(new_partial.encoded(true), value))
+		// 	// 		}
+		// 	// 		child_node => {
+		// 	// 			trace!(target: "trie", "fixing: restoring extension");
 
-			// 			// reallocate the child node.
-			// 			let stored = if let Some(hash) = maybe_hash {
-			// 				Stored::Cached(child_node, hash)
-			// 			} else {
-			// 				Stored::New(child_node)
-			// 			};
+		// 	// 			// reallocate the child node.
+		// 	// 			let stored = if let Some(hash) = maybe_hash {
+		// 	// 				Stored::Cached(child_node, hash)
+		// 	// 			} else {
+		// 	// 				Stored::New(child_node)
+		// 	// 			};
 
-			// 			Ok(Node::Extension(partial, self.storage.alloc(stored).into()))
-			// 		}
-			// 	}
-			//}
-			other => Ok(other), // only ext and branch need fixing.
+		// 	// 			Ok(Node::Extension(partial, self.storage.alloc(stored).into()))
+		// 	// 		}
+		// 	// 	}
+		// 	//}
+		    other => Ok(other), // only ext and branch need fixing.
 		}
 	}
 

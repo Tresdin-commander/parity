@@ -36,6 +36,7 @@ use ethereum_types::H256;
 use keccak::KECCAK_NULL_RLP;
 use hashdb::{HashDB, DBValue};
 
+pub mod node_radix16;
 pub mod node;
 pub mod triedb;
 pub mod triedbmut;
